@@ -45,7 +45,7 @@ concurrency:
 
 env:
   # 补丁器版本号：修改本 workflow 的补丁逻辑后 +1，可强制全量重建一次 dist
-  PATCHER_VERSION: '1'
+  PATCHER_VERSION: '2'
 
 jobs:
   danmu-latest:
@@ -156,6 +156,18 @@ jobs:
           /**
            * patch-danmu.mjs — 把「最新版 danmu_api 单文件包」以 sidecar 预载脚本的形式
            * 拼接到 douer 运行时 index.js 头部，输出自包含的新 index.js。
+           *
+           * 用法:
+           *   node patch-danmu.mjs <runtime-index.js> <danmu-bundle.cjs> <out-index.js> <meta.json>
+           *
+           * 原理:
+           *   1. 预载脚本在模块加载时把最新 danmu_api 落盘到可写目录并 require 启动，
+           *      抢占 9321（主服务）/ 5321（图片代理）端口；
+           *   2. douer 引擎 init 时其内置(旧版)弹幕服务因端口被占触发 'error' 事件，
+           *      引擎自带的错误处理只会 console.warn 并放弃（不会崩溃、不换端口重试）；
+           *   3. 引擎所有弹幕流程（/danmu-proxy、面板 QR、danmu.urls 的内置弹幕地址）
+           *      都通过 HTTP 访问 9321 → 自然命中最新版 danmu_api；
+           *   4. 预载任何一步失败均静默降级 → 内置旧版弹幕照常接管，引擎不受影响。
            */
           import fs from 'fs';
 
@@ -168,7 +180,7 @@ jobs:
           const runtime = fs.readFileSync(runtimePath, 'utf8');
           const bundle = fs.readFileSync(bundlePath, 'utf8');
 
-          // 防重复拼接（避免套娃）
+          // 防重复拼接（对已 patch 的文件再次运行时直接报错，避免套娃）
           if (runtime.includes('__danmuLatestSidecar')) {
               console.error('runtime already patched — refuse to double-patch');
               process.exit(3);
@@ -185,7 +197,7 @@ jobs:
 
           const prelude = `/* =====================================================================
            * CatPawOpen · danmu-latest sidecar  （GitHub Actions 自动生成，勿手改）
-           * 内嵌 danmu_api: ${meta.danmuVersion || 'unknown'}  (huangxd-/danmu_api@${(meta.danmuSha || 'unknown').slice(0, 7)})
+           * 内嵌 danmu_api: ${meta.danmuVersion || meta.version || 'unknown'}  (huangxd-/danmu_api@${(meta.danmuSha || meta.commit || 'unknown').slice(0, 7)})
            * 构建时间: ${meta.builtAt || 'unknown'}
            * 机制: 加载时抢先在 :9321 启动最新版 danmu_api；douer 内置旧版弹幕
            *       端口被占后自动优雅放弃（仅告警）。任何异常均回退内置弹幕。
@@ -200,6 +212,7 @@ jobs:
                   var fs = require('fs');
                   var os = require('os');
                   var path = require('path');
+                  var net = require('net');
                   var candidates = [];
                   if (process.env.CATPAW_DANMU_DIR) candidates.push(process.env.CATPAW_DANMU_DIR);
                   try { candidates.push(path.join(os.tmpdir(), 'catpaw-danmu-latest')); } catch (e) {}
@@ -219,13 +232,75 @@ jobs:
                   }
                   var file = path.join(base, 'danmu_api', 'server.cjs');
                   fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+
+                  // ---- 端口让位仲裁（解决 sidecar 异步启动 vs douer 同步 listen 的竞态） ----
+                  // sidecar 状态: 'starting' | 'ok' | 'failed'
+                  var state = { sidecar: 'starting', waiters: [] };
+                  globalThis.__danmuLatestState = state;
+                  state.settle = function (r) { settle(r); };
+                  var settle = function (next) {
+                      if (state.sidecar !== 'starting') return;
+                      state.sidecar = next;
+                      var ws = state.waiters.splice(0);
+                      for (var j = 0; j < ws.length; j++) { try { ws[j](next); } catch (e) {} }
+                  };
+                  globalThis.__danmuApiExitGuard = function (code) {
+                      console.warn('[danmu-latest] process.exit(' + code + ') intercepted; host process kept alive');
+                      if (state.sidecar === 'starting') { settle('failed'); return; }
+                      // sidecar 先成功后又退出（如 5321 被占导致整体关闭）→ 让内置旧版弹幕重新接管 9321
+                      if (state.sidecar === 'ok' && state.yielded) {
+                          var y = state.yielded; state.yielded = null; state.sidecar = 'failed';
+                          setTimeout(function () {
+                              console.warn('[danmu-latest] sidecar exited; builtin danmu re-takes :9321');
+                              try { origListen.apply(y.server, y.args); } catch (e) {}
+                          }, 500);
+                      }
+                  };
+                  var origListen = net.Server.prototype.listen;
+                  net.Server.prototype.listen = function () {
+                      var args = Array.prototype.slice.call(arguments);
+                      var self = this;
+                      // (a) sidecar 的主服务: listen({port:9321, host:'::'|'0.0.0.0'})
+                      if (args[0] && typeof args[0] === 'object' && Number(args[0].port) === 9321 && state.sidecar === 'starting') {
+                          self.once('listening', function () { settle('ok'); });
+                          self.once('error', function (err) {
+                              // 若是 IPv6 不可用，danmu_api 会自动回退 0.0.0.0 再 listen 一次，不算失败
+                              if (err && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) return;
+                              settle('failed');
+                          });
+                          return origListen.apply(self, args);
+                      }
+                      // (b) douer 内置旧版弹幕: listen(9321, '0.0.0.0', cb) —— 先等 sidecar 结果再决定
+                      if (typeof args[0] === 'number' && args[0] === 9321 && args[1] === '0.0.0.0') {
+                          var decide = function (result) {
+                              if (result === 'ok') {
+                                  console.log('[danmu-latest] builtin danmu yields :9321 to latest danmu_api');
+                                  state.yielded = { server: self, args: args };
+                                  var err = new Error('listen EADDRINUSE: address already in use 0.0.0.0:9321 (yielded to danmu-latest)');
+                                  err.code = 'EADDRINUSE'; err.errno = -98; err.syscall = 'listen'; err.address = '0.0.0.0'; err.port = 9321;
+                                  process.nextTick(function () { self.emit('error', err); });
+                              } else {
+                                  console.warn('[danmu-latest] sidecar not ready (' + result + '); builtin danmu takes :9321');
+                                  origListen.apply(self, args);
+                              }
+                          };
+                          if (state.sidecar !== 'starting') { decide(state.sidecar); return self; }
+                          var done = false;
+                          var timer = setTimeout(function () { if (!done) { done = true; decide('timeout'); } }, 15000);
+                          state.waiters.push(function (r) { if (!done) { done = true; clearTimeout(timer); decide(r); } });
+                          return self;
+                      }
+                      return origListen.apply(self, args);
+                  };
+
                   // 与 douer 内置弹幕约定保持一致：管理面板路径 /douer、端口 9321
                   process.env.ADMIN_TOKEN = 'douer';
                   delete process.env.DANMU_API_PORT;
-                  console.log('[danmu-latest] starting latest danmu_api ${meta.danmuVersion || ''} from ' + file);
+                  console.log('[danmu-latest] starting latest danmu_api ${meta.danmuVersion || meta.version || ''} from ' + file);
                   require(file);
-                  console.log('[danmu-latest] latest danmu_api loaded (binding :9321 / :5321)');
+                  console.log('[danmu-latest] latest danmu_api loading (will bind :9321 / :5321)');
               } catch (e) {
+                  try { if (globalThis.__danmuLatestState && globalThis.__danmuLatestState.settle) globalThis.__danmuLatestState.settle('failed'); } catch (_) {}
                   console.warn('[danmu-latest] disabled, fallback to builtin danmu: ' + (e && e.message));
               }
           })();
