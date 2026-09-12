@@ -45,7 +45,7 @@ concurrency:
 
 env:
   # 补丁器版本号：修改本 workflow 的补丁逻辑后 +1，可强制全量重建一次 dist
-  PATCHER_VERSION: '4'
+  PATCHER_VERSION: '5'
 
 jobs:
   danmu-latest:
@@ -99,6 +99,19 @@ jobs:
             || { echo '::error::anchor missing: process.exit(exitCode) (upstream refactored?)'; exit 1; }
           sed -i 's/process\.exit(exitCode);/if (globalThis.__danmuApiExitGuard) { globalThis.__danmuApiExitGuard(exitCode); } else { process.exit(exitCode); }/' danmu_api/server.js
 
+          # (d) handler-factory 里 node-handler 是用字符串拼接的动态 import（专为规避某些打包器），
+          #     esbuild 无法内联 → 运行时会去磁盘找 node-handler.js 而失败（面板“添加环境变量失败”）。
+          #     改回静态路径让它被打进包里。
+          grep -q "import(\['./node-handler', '.js'\].join(''))" danmu_api/configs/handlers/handler-factory.js \
+            || { echo '::error::anchor missing: dynamic node-handler import (upstream refactored?)'; exit 1; }
+          sed -i "s#import(\['./node-handler', '.js'\].join(''))#import('./node-handler.js')#g" danmu_api/configs/handlers/handler-factory.js
+
+          # (e) 单文件打包后所有模块共享同一 __dirname（=server.cjs 所在目录），
+          #     node-handler 的 ../../../config/.env 会指错位置 → 统一为与 server.js 一致的 ../config/.env
+          grep -q "path.join(__dirname, '..', '..', '..', 'config', '.env')" danmu_api/configs/handlers/node-handler.js \
+            || { echo '::error::anchor missing: node-handler envPath (upstream refactored?)'; exit 1; }
+          sed -i "s#path.join(__dirname, '..', '..', '..', 'config', '.env')#path.join(__dirname, '..', 'config', '.env')#g" danmu_api/configs/handlers/node-handler.js
+
           npm install --no-audit --no-fund --loglevel=error
 
           mkdir -p "$RUNNER_TEMP/danmu_build"
@@ -109,6 +122,9 @@ jobs:
             --banner:js='var __catpawImportMetaUrl=require("url").pathToFileURL(__filename).href;' \
             --define:import.meta.url=__catpawImportMetaUrl \
             --outfile="$RUNNER_TEMP/danmu_build/server.cjs"
+
+          cp config/.env.example "$RUNNER_TEMP/danmu_build/.env.example"
+          [ -s "$RUNNER_TEMP/danmu_build/.env.example" ] || { echo '::error::config/.env.example missing'; exit 1; }
 
           # 打包断言
           SIZE=$(stat -c%s "$RUNNER_TEMP/danmu_build/server.cjs")
@@ -171,7 +187,7 @@ jobs:
            */
           import fs from 'fs';
 
-          const [runtimePath, bundlePath, outPath, metaPath] = process.argv.slice(2);
+          const [runtimePath, bundlePath, outPath, metaPath, envExamplePath] = process.argv.slice(2);
           if (!runtimePath || !bundlePath || !outPath) {
               console.error('usage: node patch-danmu.mjs <runtime-index.js> <danmu-bundle.cjs> <out-index.js> [meta.json]');
               process.exit(2);
@@ -190,6 +206,8 @@ jobs:
               process.exit(4);
           }
 
+          const envExample = (envExamplePath && fs.existsSync(envExamplePath)) ? fs.readFileSync(envExamplePath, 'utf8') : '';
+          if (!envExample) console.warn('warning: .env.example not provided/found — panel env editing will be unavailable');
           let meta = {};
           if (metaPath && fs.existsSync(metaPath)) {
               try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch { /* ignore */ }
@@ -204,6 +222,7 @@ jobs:
            * ===================================================================== */
           globalThis.__danmuLatestSidecar = true;
           globalThis.__danmuLatestBundle = ${JSON.stringify(bundle)};
+          globalThis.__danmuLatestEnvExample = ${JSON.stringify(envExample)};
           globalThis.__danmuLatestState = { status: 'idle', port: null, fallback: null, log: [] };
           // 诊断日志：同时输出到控制台并保存在内存；并在 :9322 开一个只读诊断页（http://手机IP:9322/）
           globalThis.__danmuLatestLog = function (level, msg) {
@@ -272,6 +291,17 @@ jobs:
                   if (!base) throw new Error('no writable dir');
                   var file = path.join(base, 'danmu_api', 'server.cjs');
                   fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+                  // 配置目录：<base>/config/.env（面板“系统配置”读写此文件；只在不存在时用模板初始化，绝不覆盖用户已改内容）
+                  try {
+                      var cfgDir = path.join(base, 'config');
+                      fs.mkdirSync(cfgDir, { recursive: true });
+                      if (globalThis.__danmuLatestEnvExample) {
+                          fs.writeFileSync(path.join(cfgDir, '.env.example'), globalThis.__danmuLatestEnvExample, 'utf8');
+                          if (!fs.existsSync(path.join(cfgDir, '.env'))) {
+                              fs.writeFileSync(path.join(cfgDir, '.env'), globalThis.__danmuLatestEnvExample, 'utf8');
+                          }
+                      }
+                  } catch (e3) { globalThis.__danmuLatestLog('warn', 'config dir init failed: ' + (e3 && e3.message)); }
                   // 与引擎约定一致：管理面板路径 /douer、端口沿用引擎传入值
                   process.env.ADMIN_TOKEN = 'douer';
                   process.env.DANMU_API_PORT = String(port || 9321);
@@ -369,7 +399,8 @@ jobs:
             nodejs/dist/index.js \
             "$RUNNER_TEMP/danmu_build/server.cjs" \
             nodejs/dist/index.js \
-            "$RUNNER_TEMP/meta.json"
+            "$RUNNER_TEMP/meta.json" \
+            "$RUNNER_TEMP/danmu_build/.env.example"
           cp "$RUNNER_TEMP/meta.json" nodejs/dist/.danmu-meta.json
           node --check nodejs/dist/index.js
           echo '--- dist ---'
