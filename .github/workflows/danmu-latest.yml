@@ -1,0 +1,322 @@
+name: Danmu API Latest to dist
+
+# ============================================================================
+# 每天定时把「最新版 huangxd-/danmu_api」打进 dist 分支的 index.js。
+#
+# 特性：
+#   * 不修改 main 分支任何现有文件 —— 只在 Actions 临时工作区构建，产物 force-push 到 dist 分支
+#   * 每天定时跑（cron），也可手动触发（workflow_dispatch，支持 force 强制重建）
+#   * deploy.yml / sync-upstream.yml 覆盖 dist 后自动重新打补丁（workflow_run 联动）
+#   * dist 内容无变化时自动跳过推送（对比 .danmu-meta.json）
+#
+# 原理（sidecar 抢占式替换）：
+#   douer 运行时把旧版 danmu_api 编译进了自己的压缩包里，无法原位替换。
+#   但引擎的所有弹幕流程（/danmu-proxy、弹幕面板、danmu.urls 内置弹幕地址）
+#   都通过 HTTP 访问 :9321。因此本 workflow 在 dist/index.js 头部注入一段
+#   预载脚本：模块加载时先把「最新 danmu_api 单文件包」落盘并启动，抢占
+#   9321/5321 端口；引擎 init 时其内置旧版弹幕因端口被占只会 console.warn
+#   并优雅放弃（引擎自带该错误处理，已验证），全部弹幕流量自然命中最新版。
+#   预载任何一步失败都会静默降级回内置旧版弹幕，引擎不受影响。
+# ============================================================================
+
+on:
+  schedule:
+    # 每天 UTC 20:30 = 北京时间次日 04:30（可自行调整；GitHub cron 高峰期可能延迟 15~60 分钟）
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重建并推送 dist（忽略“无变化”检测）'
+        type: boolean
+        default: false
+  workflow_run:
+    # deploy.yml / sync-upstream.yml 会 force-push「未打补丁」的 dist，
+    # 它们成功结束后立即重跑本 workflow 把最新弹幕补回去。
+    # 注意：这里的名字必须与那两个 workflow 的 name 完全一致。
+    workflows: ['Build and Deploy', 'Sync Upstream Douer']
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: danmu-latest-dist
+  cancel-in-progress: false
+
+env:
+  # 补丁器版本号：修改本 workflow 的补丁逻辑后 +1，可强制全量重建一次 dist
+  PATCHER_VERSION: '1'
+
+jobs:
+  danmu-latest:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: nodejs/package-lock.json
+
+      # ---------- 1. 拉取最新 danmu_api 源码，记录版本 ----------
+      - name: Fetch latest danmu_api
+        id: danmu
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/danmu_api_src"
+          git clone --depth 1 https://github.com/huangxd-/danmu_api.git "$RUNNER_TEMP/danmu_api_src"
+          cd "$RUNNER_TEMP/danmu_api_src"
+          SHA="$(git rev-parse HEAD)"
+          VER="$(node -e 'const s=require("fs").readFileSync("danmu_api/configs/globals.js","utf8");const m=s.match(/VERSION:\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]/);console.log(m?m[1]:"0.0.0")')"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "danmu_api latest: v$VER ($SHA)"
+
+      # ---------- 2. 源码手术（sidecar 化）+ esbuild 单文件打包 ----------
+      - name: Build danmu_api single-file bundle
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/danmu_api_src"
+
+          # (a) 去除顶层 await —— CJS 打包不支持 TLA。
+          #     打包后 esm-shim 必然处于禁用态（node-fetch 已被打进包里），
+          #     loadNodeFetch 是 no-op，改成 fire-and-forget 语义完全等价。
+          grep -q 'await global.loadNodeFetch();' danmu_api/server.js \
+            || { echo '::error::anchor missing: top-level await loadNodeFetch (upstream refactored?)'; exit 1; }
+          sed -i 's/await global\.loadNodeFetch();/global.loadNodeFetch().catch(function(e){console.warn("[esm-shim] loadNodeFetch skipped:", e\&\&e.message);});/' danmu_api/server.js
+
+          # (b) 移除 SIGTERM/SIGINT 注册 —— sidecar 与宿主(App)同进程，
+          #     不应干涉宿主进程生命周期（尽力而为，锚点缺失不致命）。
+          sed -i "/process\.on('SIGTERM', () => cleanupWatcher(0));/d" danmu_api/server.js || true
+          sed -i "/process\.on('SIGINT', () => cleanupWatcher(0));/d" danmu_api/server.js || true
+
+          # (c) process.exit 加保护 —— sidecar 启动失败(如端口被第三方占用)时，
+          #     绝不能把整个 App 进程带崩。
+          grep -q 'process.exit(exitCode);' danmu_api/server.js \
+            || { echo '::error::anchor missing: process.exit(exitCode) (upstream refactored?)'; exit 1; }
+          sed -i 's/process\.exit(exitCode);/if (globalThis.__danmuApiExitGuard) { globalThis.__danmuApiExitGuard(exitCode); } else { process.exit(exitCode); }/' danmu_api/server.js
+
+          npm install --no-audit --no-fund --loglevel=error
+
+          mkdir -p "$RUNNER_TEMP/danmu_build"
+          # banner+define：CJS 输出下补齐 import.meta.url（server.js 用它推导 __dirname）
+          npx esbuild danmu_api/server.js \
+            --bundle --platform=node --format=cjs --target=node18 --charset=utf8 \
+            --external:esbuild --minify \
+            --banner:js='var __catpawImportMetaUrl=require("url").pathToFileURL(__filename).href;' \
+            --define:import.meta.url=__catpawImportMetaUrl \
+            --outfile="$RUNNER_TEMP/danmu_build/server.cjs"
+
+          # 打包断言
+          SIZE=$(stat -c%s "$RUNNER_TEMP/danmu_build/server.cjs")
+          [ "$SIZE" -ge 1000000 ] || { echo "::error::bundle too small: $SIZE bytes"; exit 1; }
+          EXITS=$(grep -o 'process\.exit(' "$RUNNER_TEMP/danmu_build/server.cjs" | wc -l)
+          GUARDS=$(grep -o '__danmuApiExitGuard' "$RUNNER_TEMP/danmu_build/server.cjs" | wc -l)
+          [ "$EXITS" -le "$GUARDS" ] || { echo "::error::unguarded process.exit left in bundle (exit=$EXITS guard=$GUARDS)"; exit 1; }
+          echo "bundle ok: $SIZE bytes (process.exit=$EXITS, guarded=$GUARDS)"
+
+      # ---------- 3. 冒烟测试：真实启动一次并访问管理面板 ----------
+      - name: Smoke test bundle
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/danmu_build"
+          rm -rf run && mkdir -p run/danmu_api && cp server.cjs run/danmu_api/
+          cd run
+          ADMIN_TOKEN=douer DANMU_API_PORT=19321 node danmu_api/server.cjs > smoke.log 2>&1 &
+          PID=$!
+          OK=0
+          for _ in $(seq 1 30); do
+            sleep 1
+            if curl -sf -o /dev/null http://127.0.0.1:19321/douer; then OK=1; break; fi
+            kill -0 "$PID" 2>/dev/null || break
+          done
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          [ "$OK" = "1" ] || { echo '::error::smoke test failed, log:'; cat smoke.log; exit 1; }
+          echo 'smoke ok: danmu_api panel reachable on :19321/douer'
+
+      # ---------- 4. 构建本仓库 dist（与 deploy.yml 相同步骤；main 只读） ----------
+      - name: Install and build repo dist
+        working-directory: nodejs
+        run: |
+          npm ci
+          npm run build
+
+      # ---------- 5. 打补丁：把最新 danmu_api 注入 dist/index.js 头部 ----------
+      - name: Patch dist runtime with latest danmu_api
+        env:
+          DANMU_VERSION: ${{ steps.danmu.outputs.version }}
+          DANMU_SHA: ${{ steps.danmu.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/patch-danmu.mjs" <<'PATCH_EOF'
+          /**
+           * patch-danmu.mjs — 把「最新版 danmu_api 单文件包」以 sidecar 预载脚本的形式
+           * 拼接到 douer 运行时 index.js 头部，输出自包含的新 index.js。
+           */
+          import fs from 'fs';
+
+          const [runtimePath, bundlePath, outPath, metaPath] = process.argv.slice(2);
+          if (!runtimePath || !bundlePath || !outPath) {
+              console.error('usage: node patch-danmu.mjs <runtime-index.js> <danmu-bundle.cjs> <out-index.js> [meta.json]');
+              process.exit(2);
+          }
+
+          const runtime = fs.readFileSync(runtimePath, 'utf8');
+          const bundle = fs.readFileSync(bundlePath, 'utf8');
+
+          // 防重复拼接（避免套娃）
+          if (runtime.includes('__danmuLatestSidecar')) {
+              console.error('runtime already patched — refuse to double-patch');
+              process.exit(3);
+          }
+          if (bundle.length < 500 * 1024) {
+              console.error(`danmu bundle suspiciously small (${bundle.length} bytes) — refuse to embed`);
+              process.exit(4);
+          }
+
+          let meta = {};
+          if (metaPath && fs.existsSync(metaPath)) {
+              try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch { /* ignore */ }
+          }
+
+          const prelude = `/* =====================================================================
+           * CatPawOpen · danmu-latest sidecar  （GitHub Actions 自动生成，勿手改）
+           * 内嵌 danmu_api: ${meta.danmuVersion || 'unknown'}  (huangxd-/danmu_api@${(meta.danmuSha || 'unknown').slice(0, 7)})
+           * 构建时间: ${meta.builtAt || 'unknown'}
+           * 机制: 加载时抢先在 :9321 启动最新版 danmu_api；douer 内置旧版弹幕
+           *       端口被占后自动优雅放弃（仅告警）。任何异常均回退内置弹幕。
+           * ===================================================================== */
+          globalThis.__danmuLatestSidecar = true;
+          globalThis.__danmuApiExitGuard = function (code) {
+              console.warn('[danmu-latest] process.exit(' + code + ') intercepted; host process kept alive');
+          };
+          globalThis.__danmuLatestBundle = ${JSON.stringify(bundle)};
+          (function () {
+              try {
+                  var fs = require('fs');
+                  var os = require('os');
+                  var path = require('path');
+                  var candidates = [];
+                  if (process.env.CATPAW_DANMU_DIR) candidates.push(process.env.CATPAW_DANMU_DIR);
+                  try { candidates.push(path.join(os.tmpdir(), 'catpaw-danmu-latest')); } catch (e) {}
+                  try { candidates.push(path.join(process.cwd(), '.catpaw-danmu-latest')); } catch (e) {}
+                  var base = null;
+                  for (var i = 0; i < candidates.length; i++) {
+                      try {
+                          fs.mkdirSync(path.join(candidates[i], 'danmu_api'), { recursive: true });
+                          fs.accessSync(candidates[i], fs.constants.W_OK);
+                          base = candidates[i];
+                          break;
+                      } catch (e) { /* try next */ }
+                  }
+                  if (!base) {
+                      console.warn('[danmu-latest] no writable dir found; fallback to builtin danmu');
+                      return;
+                  }
+                  var file = path.join(base, 'danmu_api', 'server.cjs');
+                  fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+                  // 与 douer 内置弹幕约定保持一致：管理面板路径 /douer、端口 9321
+                  process.env.ADMIN_TOKEN = 'douer';
+                  delete process.env.DANMU_API_PORT;
+                  console.log('[danmu-latest] starting latest danmu_api ${meta.danmuVersion || ''} from ' + file);
+                  require(file);
+                  console.log('[danmu-latest] latest danmu_api loaded (binding :9321 / :5321)');
+              } catch (e) {
+                  console.warn('[danmu-latest] disabled, fallback to builtin danmu: ' + (e && e.message));
+              }
+          })();
+          `;
+
+          fs.writeFileSync(outPath, prelude + runtime, 'utf8');
+
+          // 重新生成 md5（与仓库 copy-runtime.mjs 行为一致）
+          const { createHash } = await import('crypto');
+          const md5 = createHash('md5').update(fs.readFileSync(outPath)).digest('hex');
+          fs.writeFileSync(outPath + '.md5', md5);
+
+          console.log(`patched index.js written: ${outPath} (${(fs.statSync(outPath).size / 1024 / 1024).toFixed(2)} MB, md5=${md5})`);
+          PATCH_EOF
+
+          RUNTIME_MD5="$(cat nodejs/vendor/douer/index.js.md5 2>/dev/null || md5sum nodejs/vendor/douer/index.js | cut -d' ' -f1)"
+          CONFIG_MD5="$(cat nodejs/dist/index.config.js.md5)"
+          cat > "$RUNNER_TEMP/meta.json" <<META_EOF
+          {"danmuVersion":"${DANMU_VERSION}","danmuSha":"${DANMU_SHA}","builtAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","runtimeMd5":"${RUNTIME_MD5}","configMd5":"${CONFIG_MD5}","patcherVersion":"${PATCHER_VERSION}"}
+          META_EOF
+
+          node "$RUNNER_TEMP/patch-danmu.mjs" \
+            nodejs/dist/index.js \
+            "$RUNNER_TEMP/danmu_build/server.cjs" \
+            nodejs/dist/index.js \
+            "$RUNNER_TEMP/meta.json"
+          cp "$RUNNER_TEMP/meta.json" nodejs/dist/.danmu-meta.json
+          node --check nodejs/dist/index.js
+          echo '--- dist ---'
+          ls -la nodejs/dist/
+
+      # ---------- 6. dist 已是最新则跳过推送 ----------
+      - name: Check if dist is already up to date
+        id: cmp
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          NEW="$(cat nodejs/dist/.danmu-meta.json)"
+          OLD=""
+          if git fetch --depth 1 origin dist >/dev/null 2>&1; then
+            OLD="$(git show FETCH_HEAD:nodejs/dist/.danmu-meta.json 2>/dev/null || true)"
+          fi
+          SAME=false
+          if [ -n "$OLD" ]; then
+            SAME="$(node -e 'const a=JSON.parse(process.argv[1]||"{}"),b=JSON.parse(process.argv[2]||"{}");const ks=["danmuSha","runtimeMd5","configMd5","patcherVersion"];console.log(ks.every(k=>a[k]&&a[k]===b[k])?"true":"false");' "$OLD" "$NEW")"
+          fi
+          if [ "$SAME" = "true" ] && [ "${FORCE:-}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "dist 已包含相同 danmu_api/运行时/配置 — 跳过推送"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "将重建 dist（force=${FORCE:-}, changed=$([ "$SAME" = "true" ] && echo no || echo yes)）"
+          fi
+
+      # ---------- 7. 部署：force-push dist 分支（布局与 deploy.yml 完全一致） ----------
+      - name: Deploy to dist branch
+        if: steps.cmp.outputs.skip != 'true'
+        env:
+          DANMU_VERSION: ${{ steps.danmu.outputs.version }}
+          DANMU_SHA: ${{ steps.danmu.outputs.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf deploy && mkdir -p deploy/nodejs deploy/docx-cleaner
+          cp -r nodejs/dist deploy/nodejs/
+          cp -r docx-cleaner/web/* deploy/docx-cleaner/
+          cd deploy
+          git init -q
+          git checkout -b dist
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -q -m "deploy: danmu_api v${DANMU_VERSION}@${DANMU_SHA:0:7} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --force -q "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" dist
+          echo "dist branch updated ✓"
+
+      # ---------- 8. 运行摘要 ----------
+      - name: Summary
+        if: always()
+        env:
+          DANMU_VERSION: ${{ steps.danmu.outputs.version }}
+          DANMU_SHA: ${{ steps.danmu.outputs.sha }}
+          SKIP: ${{ steps.cmp.outputs.skip }}
+        run: |
+          {
+            echo "## danmu-latest 构建摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| danmu_api 版本 | v${DANMU_VERSION:-?} (${DANMU_SHA:0:7}) |"
+            echo "| 结果 | $([ "${SKIP:-}" = "true" ] && echo '无变化，跳过推送' || echo '已重建并推送 dist 分支') |"
+            echo ""
+            echo "dist 分支 \`nodejs/dist/index.js\` 内嵌最新弹幕 API；旧版内置弹幕自动让位（端口抢占），失败自动回退。"
+          } >> "$GITHUB_STEP_SUMMARY"
