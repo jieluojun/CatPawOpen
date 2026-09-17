@@ -17,6 +17,19 @@ name: Danmu API Latest to dist
 #   9321/5321 端口；引擎 init 时其内置旧版弹幕因端口被占只会 console.warn
 #   并优雅放弃（引擎自带该错误处理，已验证），全部弹幕流量自然命中最新版。
 #   预载任何一步失败都会静默降级回内置旧版弹幕，引擎不受影响。
+#
+# v6 修复（问题现象：App 启动后看到的 danmu_api 版本号仍是旧版）：
+#   sidecar 落盘目录此前只试 os.tmpdir() 与 process.cwd()。在默影视/MiraPlay
+#   这类宿主里两者都不可用（nodejs-mobile 的宿主进程 cwd 常是只读的 "/"，
+#   Android 根本没有 /tmp），于是「no writable dir」→ 静默回退到引擎内置的
+#   旧版弹幕 → 版本号自然还是旧版。现在候选目录按稳定性排序，优先用宿主
+#   提供的可写数据目录（NODE_PATH / bundle 同级目录），并用真实写入探测代替
+#   accessSync（Android SELinux 下 access 通过但写入被拒）。
+#   同时不再对未验证的父链调用 mkdirSync(recursive)——实测那会在同步调用里
+#   无限重试、100% CPU 卡死整个 Node 进程（弹幕服务和宿主一起没救）。
+#   构建末尾新增一步「真机模拟自检」：按宿主 boot.js 完全相同的方式
+#   require(index.js) + start(config)，断言 :9321 返回的 version 就是本次
+#   抓到的 danmu_api 最新版；拿不到就 fail 构建，不再静默产出旧版。
 # ============================================================================
 
 on:
@@ -45,7 +58,8 @@ concurrency:
 
 env:
   # 补丁器版本号：修改本 workflow 的补丁逻辑后 +1，可强制全量重建一次 dist
-  PATCHER_VERSION: '5'
+  # v6：sidecar 可写目录探测重写（真机上此前恒失败 → 一直回退旧版内置弹幕）
+  PATCHER_VERSION: '6'
 
 jobs:
   danmu-latest:
@@ -213,34 +227,78 @@ jobs:
               try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch { /* ignore */ }
           }
 
+          // 以下值在「打补丁」那一刻固化进 dist/index.js，运行时只读，不再回查任何远端
+          const ver = String(meta.danmuVersion || meta.version || 'unknown');
+          const sha7 = String(meta.danmuSha || meta.commit || 'unknown').slice(0, 7);
+          const builtAt = String(meta.builtAt || 'unknown');
+
+          // 找出引擎内联的那份 danmu_api 全局配置对象（configs/globals.js 的编译产物）：
+          // 它的 VERSION 常量就是宿主/面板看到的「内置弹幕 API 版本」。
+          // 最新版接管成功后把它同步成实际在服务的新版本，避免界面仍显示旧版本号。
+          const gv = runtime.match(/([A-Za-z0-9_$]{1,4})=\{env:\{\},envs:\{\},originalEnvVars:\{\},accessedEnvVars:\{\},VERSION:"([\d.]+)"/);
+          const globalsVar = gv ? gv[1] : null;
+          const builtinVer = gv ? gv[2] : 'unknown';
+          if (!gv) console.warn('warning: 未能定位引擎内置 danmu_api 版本常量，接管后不会再同步版本号显示');
+          else console.log(`engine builtin danmu_api version = ${builtinVer} (globals var "${globalsVar}") → 内嵌 ${ver}`);
+
+          const applyFn = globalsVar
+              ? `globalThis.__danmuLatestGlobals = function () {
+                    try { var g = (typeof ${globalsVar} === 'undefined') ? null : ${globalsVar}; return (g && typeof g === 'object') ? g : null; } catch (e) { return null; }
+                };
+                globalThis.__danmuLatestApplyGlobals = function () {
+                    try { var g = globalThis.__danmuLatestGlobals(); if (!g) return 'unreachable'; g.VERSION = ${JSON.stringify(ver)}; return 'ok'; } catch (e) { return 'error:' + (e && e.message); }
+                };
+                globalThis.__danmuLatestRevertGlobals = function () {
+                    try { var g = globalThis.__danmuLatestGlobals(); if (!g) return 'unreachable'; g.VERSION = ${JSON.stringify(builtinVer)}; return 'ok'; } catch (e) { return 'error:' + (e && e.message); }
+                };`
+              : `globalThis.__danmuLatestGlobals = function () { return null; };
+                globalThis.__danmuLatestApplyGlobals = function () { return 'no-anchor'; };
+                globalThis.__danmuLatestRevertGlobals = function () { return 'no-anchor'; };`;
+
           const prelude = `/* =====================================================================
            * CatPawOpen · danmu-latest  （GitHub Actions 自动生成，勿手改）
-           * 内嵌 danmu_api: ${meta.danmuVersion || meta.version || 'unknown'}  (huangxd-/danmu_api@${(meta.danmuSha || meta.commit || 'unknown').slice(0, 7)})
-           * 构建时间: ${meta.builtAt || 'unknown'}
+           * 内嵌 danmu_api: ${ver}  (huangxd-/danmu_api@${sha7})
+           * 引擎内置(旧) danmu_api: ${builtinVer}  —— 仅在最新版接管失败时才在服务
+           * 构建时间: ${builtAt}
            * 机制: 引擎内置弹幕的启动入口 dDt() 被替换为启动最新版 danmu_api；
            *       旧版启动函数保留为 dDt_builtin()，仅在最新版启动失败时作为兜底。
+           * 自检: 启动后自己访问 :9321/api/config 核对真实在服务的版本号，
+           *       结论写在 http://<设备IP>:9322/ 诊断页（选定目录/失败原因都在里面）。
            * ===================================================================== */
           globalThis.__danmuLatestSidecar = true;
           globalThis.__danmuLatestBundle = ${JSON.stringify(bundle)};
           globalThis.__danmuLatestEnvExample = ${JSON.stringify(envExample)};
-          globalThis.__danmuLatestState = { status: 'idle', port: null, fallback: null, log: [] };
-          // 诊断日志：同时输出到控制台并保存在内存；并在 :9322 开一个只读诊断页（http://手机IP:9322/）
+          globalThis.__danmuLatestMeta = { version: '${ver}', sha: '${sha7}', builtin: '${builtinVer}', builtAt: '${builtAt}' };
+          globalThis.__danmuLatestState = { status: 'idle', port: null, fallback: null, dir: null, serving: null, log: [] };
+          // 诊断日志：控制台 + 内存 + 落盘（logcat 滚掉之后还能查），并在 :9322 开只读诊断页
           globalThis.__danmuLatestLog = function (level, msg) {
               var st = globalThis.__danmuLatestState;
               var line = new Date().toISOString() + ' ' + msg;
               st.log.push(line); if (st.log.length > 200) st.log.shift();
               try { (level === 'warn' ? console.warn : console.log)('[danmu-latest] ' + msg); } catch (e) {}
+              if (st.dir) { try { require('fs').appendFileSync(require('path').join(st.dir, 'danmu-latest.log'), line + '\\n'); } catch (e2) {} }
           };
+          // 最新版接管成功后才同步引擎内置的版本常量（回退时不动，保持显示真实在服务的老版本）
+          ${applyFn}
           (function () {
               try {
                   var http = require('http');
                   var srv = http.createServer(function (req, res) {
                       var st = globalThis.__danmuLatestState;
+                      // 只回显根路径和 *.log：宿主扫端口找猫源服务时会探 /config，其它一律 404
+                      var u = String((req && req.url) || '/').split('?')[0];
+                      if (!(u === '/' || u === '/log' || /\\.(log|txt)$/i.test(u))) {
+                          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+                          res.end('not found\\n');
+                          return;
+                      }
                       var body = 'danmu-latest diagnostics\\n' +
-                          'embedded danmu_api: ${meta.danmuVersion || meta.version || 'unknown'} (${(meta.danmuSha || meta.commit || 'unknown').slice(0, 7)})\\n' +
-                          'built at: ${meta.builtAt || 'unknown'}\\n' +
+                          'serving now: ' + (st.serving || 'unknown') + '  (status: ' + st.status + ', port: ' + st.port + ')\\n' +
+                          'embedded danmu_api: ' + globalThis.__danmuLatestMeta.version + '  (huangxd-/danmu_api@' + globalThis.__danmuLatestMeta.sha + ')\\n' +
+                          'engine builtin danmu_api: ' + globalThis.__danmuLatestMeta.builtin + '\\n' +
+                          'built at: ' + globalThis.__danmuLatestMeta.builtAt + '\\n' +
                           'node: ' + process.version + ' ' + process.platform + '/' + process.arch + '\\n' +
-                          'status: ' + st.status + '  port: ' + st.port + '\\n' +
+                          'writable dir: ' + (st.dir || 'not selected yet') + '\\n' +
                           'cwd: ' + process.cwd() + '\\n\\n--- log ---\\n' + st.log.join('\\n') + '\\n';
                       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
                       res.end(body);
@@ -258,6 +316,8 @@ jobs:
                   var fb = st.fallback; st.fallback = null;
                   setTimeout(function () {
                       globalThis.__danmuLatestLog('warn', 'latest danmu_api failed; starting builtin danmu as fallback');
+                      // 回退到内置旧版之后，把之前同步过的版本标识还原，别让界面显示成新版
+                      try { globalThis.__danmuLatestRevertGlobals(); } catch (eR) {}
                       try { fb(); } catch (e) { console.warn('[danmu-latest] builtin fallback failed: ' + (e && e.message)); }
                   }, 300);
               }
@@ -276,29 +336,72 @@ jobs:
                   var fs = require('fs');
                   var os = require('os');
                   var path = require('path');
-                  var candidates = [];
-                  if (process.env.CATPAW_DANMU_DIR) candidates.push(process.env.CATPAW_DANMU_DIR);
-                  try { candidates.push(path.join(os.tmpdir(), 'catpaw-danmu-latest')); } catch (e) {}
-                  try { candidates.push(path.join(process.cwd(), '.catpaw-danmu-latest')); } catch (e) {}
-                  for (var i = 0; i < candidates.length; i++) {
+                  // ---- 选一个真正可写的落盘目录 ----
+                  // 真机上的坑：宿主进程 cwd 常常是只读的 "/"，os.tmpdir() 又指向并不存在的
+                  // "/tmp"，只试这两项就会一个都选不中 → 静默回退引擎内置旧版弹幕，
+                  // 表现就是「App 启动后 danmu_api 版本号还是老版本」。
+                  // 所以候选按稳定性排序：显式覆盖 > 宿主数据目录(NODE_PATH) > bundle 同级目录
+                  // （默影视在这里写 port/data，必定可写）> 引导脚本目录 > 临时目录 > cwd。
+                  var roots = [];
+                  var why = [];
+                  var addRoot = function (rootDir, sub) {
+                      if (!rootDir) return;
+                      var dir;
+                      try { dir = path.resolve(sub ? path.join(rootDir, sub) : rootDir); } catch (e) { return; }
+                      for (var k = 0; k < roots.length; k++) { if (roots[k] === dir) return; }
+                      roots.push(dir);
+                  };
+                  addRoot(process.env.CATPAW_DANMU_DIR, '');
+                  addRoot(process.env.NODE_PATH, '.catpaw-danmu-latest');
+                  try { addRoot(typeof __dirname !== 'undefined' ? __dirname : (require.main && require.main.path), '.catpaw-danmu-latest'); } catch (e) {}
+                  try { addRoot(process.argv[1] ? path.dirname(path.resolve(process.argv[1])) : null, '.catpaw-danmu-latest'); } catch (e) {}
+                  try { addRoot(os.tmpdir(), 'catpaw-danmu-latest'); } catch (e) {}
+                  try { addRoot(process.cwd(), '.catpaw-danmu-latest'); } catch (e) {}
+                  for (var i = 0; i < roots.length; i++) {
+                      var cand = roots[i];
                       try {
-                          fs.mkdirSync(path.join(candidates[i], 'danmu_api'), { recursive: true });
-                          fs.accessSync(candidates[i], fs.constants.W_OK);
-                          base = candidates[i];
+                          var parent = path.dirname(cand);
+                          // 绝不用 { recursive: true }：父目录链上有只读/伪文件系统时，node 为了「补齐父目录」
+                          // 会在这个同步调用里无限重试 —— 实测 100% CPU 把整个 Node 进程卡死（连宿主信号都收不到）。
+                          if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) { why.push(cand + ' <- 父目录不存在'); continue; }
+                          fs.accessSync(parent, fs.constants.W_OK);
+                          try { fs.mkdirSync(cand); } catch (e0) { if (!e0 || e0.code !== 'EEXIST') { why.push(cand + ' <- ' + (e0.code || e0.message)); continue; } }
+                          // Android 的 SELinux 下 access(W_OK) 通过但真正写文件仍会被拒，所以用真实写入探测
+                          var probe = path.join(cand, '.catpaw-writable');
+                          fs.writeFileSync(probe, 'ok');
+                          fs.unlinkSync(probe);
+                          ['danmu_api', 'config'].forEach(function (sub) {
+                              try { fs.mkdirSync(path.join(cand, sub)); } catch (eM) { if (!eM || eM.code !== 'EEXIST') throw eM; }
+                          });
+                          base = cand;
+                          st.dir = base;
+                          globalThis.__danmuLatestLog('info', 'writable dir selected: ' + base);
                           break;
-                      } catch (e) { /* try next */ }
+                      } catch (e1) { why.push(cand + ' <- ' + (e1.code || e1.message)); }
                   }
-                  if (!base) throw new Error('no writable dir');
+                  if (!base) throw new Error('no writable dir (tried: ' + roots.join(' , ') + ' ; ' + why.join(' ; ') + ')');
                   var file = path.join(base, 'danmu_api', 'server.cjs');
-                  fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+                  // 磁盘上已是同一份内容就不再重写（每次启动写 2.7MB 对闪存和冷启动都不友好）；
+                  // 校验用的是内嵌包自身的 md5，所以绝不会出现「跳过写入结果加载到旧包」。
+                  try {
+                      var hs = require('crypto').createHash('md5').update(globalThis.__danmuLatestBundle, 'utf8').digest('hex');
+                      var hf = path.join(base, '.bundle-md5');
+                      if (fs.existsSync(file) && fs.existsSync(hf) && String(fs.readFileSync(hf, 'utf8')).trim() === hs) {
+                          globalThis.__danmuLatestLog('info', 'bundle on disk already up to date, skip rewrite');
+                      } else {
+                          fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+                          try { fs.writeFileSync(hf, hs); } catch (eH) {}
+                          globalThis.__danmuLatestLog('info', 'bundle written to disk (' + Math.round(globalThis.__danmuLatestBundle.length / 1024) + ' KB)');
+                      }
+                  } catch (eW) {
+                      fs.writeFileSync(file, globalThis.__danmuLatestBundle, 'utf8');
+                  }
                   // 配置目录：<base>/config/.env（面板“系统配置”读写此文件；只在不存在时用模板初始化，绝不覆盖用户已改内容）
                   try {
-                      var cfgDir = path.join(base, 'config');
-                      fs.mkdirSync(cfgDir, { recursive: true });
                       if (globalThis.__danmuLatestEnvExample) {
-                          fs.writeFileSync(path.join(cfgDir, '.env.example'), globalThis.__danmuLatestEnvExample, 'utf8');
-                          if (!fs.existsSync(path.join(cfgDir, '.env'))) {
-                              fs.writeFileSync(path.join(cfgDir, '.env'), globalThis.__danmuLatestEnvExample, 'utf8');
+                          fs.writeFileSync(path.join(base, 'config', '.env.example'), globalThis.__danmuLatestEnvExample, 'utf8');
+                          if (!fs.existsSync(path.join(base, 'config', '.env'))) {
+                              fs.writeFileSync(path.join(base, 'config', '.env'), globalThis.__danmuLatestEnvExample, 'utf8');
                           }
                       }
                   } catch (e3) { globalThis.__danmuLatestLog('warn', 'config dir init failed: ' + (e3 && e3.message)); }
@@ -306,10 +409,33 @@ jobs:
                   process.env.ADMIN_TOKEN = 'douer';
                   process.env.DANMU_API_PORT = String(port || 9321);
                   st.status = 'running'; st.port = port; st.fallback = fallback;
-                  globalThis.__danmuLatestLog('info', 'starting latest danmu_api ${meta.danmuVersion || meta.version || ''} on :' + port + ' from ' + file);
+                  globalThis.__danmuLatestLog('info', 'starting latest danmu_api ' + globalThis.__danmuLatestMeta.version + ' on :' + port + ' from ' + file);
                   var how = globalThis.__danmuLatestLoad(file, globalThis.__danmuLatestBundle);
                   globalThis.__danmuLatestLog('info', 'danmu_api bundle loaded via ' + how);
                   try { fs.writeFileSync(path.join(base, 'last-start.txt'), new Date().toISOString() + ' ok via ' + how + ' node=' + process.version); } catch (e2) {}
+                  // 接管成立：把引擎里那份内置 danmu_api 的版本标识同步成真正在服务的版本
+                  var ap = globalThis.__danmuLatestApplyGlobals();
+                  if (ap !== 'ok') globalThis.__danmuLatestLog('warn', 'engine version label not synced: ' + ap);
+                  // 自检：过一会儿真访一次 :port/api/config，看占用该端口的到底是不是最新版
+                  setTimeout(function () {
+                      try {
+                          require('http').get({ host: '127.0.0.1', port: port, path: '/api/config', timeout: 5000 }, function (res) {
+                              var buf = '';
+                              res.setEncoding && res.setEncoding('utf8');
+                              res.on('data', function (d) { buf += d; if (buf.length > 262144) { try { res.destroy(); } catch (e) {} } });
+                              res.on('end', function () {
+                                  var seen = '';
+                                  try { seen = (JSON.parse(buf).version || '') + ''; } catch (e) { seen = 'HTTP ' + res.statusCode; }
+                                  st.serving = seen || 'unknown';
+                                  globalThis.__danmuLatestLog(seen === globalThis.__danmuLatestMeta.version ? 'info' : 'warn',
+                                      'self-check: :' + port + ' /api/config 报出的 danmu_api 版本 = ' + st.serving + '（期望 ' + globalThis.__danmuLatestMeta.version + '）');
+                              });
+                          }).on('error', function (e) {
+                              st.serving = 'unreachable';
+                              globalThis.__danmuLatestLog('warn', 'self-check failed: ' + (e && e.message));
+                          });
+                      } catch (e) {}
+                  }, 2500);
                   return true;
               } catch (e) {
                   st.status = 'failed';
@@ -406,7 +532,87 @@ jobs:
           echo '--- dist ---'
           ls -la nodejs/dist/
 
-      # ---------- 6. dist 已是最新则跳过推送 ----------
+      # ---------- 6. 真机模拟自检：按宿主的加载方式跑一遍，确认 :9321 上服务的就是最新版 ----------
+      # 默影视/MiraPlay 用 nodejs-mobile 跑 index.js：把 bundle 放在自己的私有目录，
+      # 用 require(index.js) + mod.start(config) 拉起来；宿主进程 cwd 是只读的 "/"、
+      # 没有 /tmp，只有它传给 bundle 的 NODE_PATH（boot.js 里设）可写。这里把这几件事
+      # 一并复刻：
+      #   * bundle 拷到独立目录并钉成 commonjs（仓库里 package.json 是 type:module，
+      #     直接在 nodejs/dist 下 require 会被当 ESM 解析，跟真机不是一回事）
+      #   * 该目录与进程 cwd 都设成只读 → 只有 NODE_PATH 可选，正是真机情形
+      #   * TMPDIR 指向「父目录只读的不存在路径」= Android 上的 /tmp
+      #   * --max-old-space-size=256，与 App 起 Node 的参数一致
+      # 通过条件：sidecar 落盘成功 + 单文件包加载成功 + :9321/api/config 报出的版本
+      # == 本次抓到的 danmu_api 最新版。任一不满足直接 fail，不再把「补丁打了、实际仍跑
+      # 旧版」的 dist 推出去（那正是之前版本号一直显示旧版却没人发现的原因）。
+      - name: Verify patched runtime serves latest danmu_api
+        id: verify
+        env:
+          DANMU_VERSION: ${{ steps.danmu.outputs.version }}
+        run: |
+          set -euo pipefail
+          SIM="$RUNNER_TEMP/devicesim"
+          export SIM
+          rm -rf "$SIM" && mkdir -p "$SIM/run" "$SIM/data" "$SIM/ro"
+          cp nodejs/dist/index.js nodejs/dist/index.config.js "$SIM/run/"
+          printf '{"type":"commonjs"}\n' > "$SIM/run/package.json"
+          # 复刻 App 侧 NodeBoot 生成的 boot.js：require(index.js) 拿 mod.start 再 start(config)
+          cat > "$SIM/run/boot.cjs" <<'BOOT_EOF'
+          'use strict';
+          const http = require('http');
+          globalThis.catServerFactory = (handler) => http.createServer(handler);
+          globalThis.catDartServerPort = () => 0;
+          process.env.DEV_HTTP_PORT = process.env.SIM_PORT || '3041';
+          process.env.NODE_PATH = process.env.SIM_DATA;
+          (async () => {
+              const mod = require(process.env.SIM_BUNDLE);
+              const start = mod.start || (mod.default && mod.default.start);
+              if (typeof start !== 'function') throw new Error('bundle has no start()');
+              let conf = {};
+              try {
+                  const raw = require(process.env.SIM_CONFIG);
+                  conf = raw && raw.default ? raw.default : (raw || {});
+                  console.log('boot: config keys ' + Object.keys(conf).length);
+              } catch (e) { console.error('boot: config load failed ' + e.message); }
+              await start(conf);
+              console.log('boot: start() resolved');
+          })().catch((e) => { console.error('boot failed ' + (e && (e.stack || e.message))); process.exit(1); });
+          BOOT_EOF
+          chmod 555 "$SIM/ro" "$SIM/run"
+          SIM_BUNDLE="$SIM/run/index.js" SIM_CONFIG="$SIM/run/index.config.js" \
+          SIM_DATA="$SIM/data" SIM_PORT=3041 TMPDIR="$SIM/ro/no-tmp" \
+          sh -c 'cd "$SIM/ro" && NODE_PATH="$SIM_DATA" exec node --max-old-space-size=256 "$SIM/run/boot.cjs"' \
+            > "$SIM/boot.log" 2>&1 &
+          BOOT_PID=$!
+          ACTUAL=""
+          for _ in $(seq 1 45); do
+            sleep 2
+            ACTUAL="$(curl -sf -m 4 http://127.0.0.1:9321/api/config 2>/dev/null | grep -o '"version":"[0-9][^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+            [ -n "$ACTUAL" ] && break
+            kill -0 "$BOOT_PID" 2>/dev/null || break
+          done
+          sleep 4
+          echo '--- boot.log（末 50 行）---'
+          tail -n 50 "$SIM/boot.log" || true
+          echo '--- 诊断页 http://127.0.0.1:9322/（真机上是 http://<设备IP>:9322/）---'
+          curl -s -m 5 http://127.0.0.1:9322/ || true
+          kill "$BOOT_PID" 2>/dev/null || true
+          wait "$BOOT_PID" 2>/dev/null || true
+          chmod -R u+w "$SIM" 2>/dev/null || true
+          grep -q 'writable dir selected' "$SIM/boot.log" \
+            || { echo '::error::sidecar 在「仅 NODE_PATH 可写」的设备环境下找不到落盘目录 —— 真机上必然回退旧版内置弹幕，App 里版本号就还是老的'; exit 1; }
+          grep -q 'bundle loaded via' "$SIM/boot.log" \
+            || { echo '::error::sidecar 没能加载 danmu_api 单文件包'; exit 1; }
+          [ -n "$ACTUAL" ] || { echo '::error:::9321 无响应 —— 打完补丁后弹幕服务根本没起来'; exit 1; }
+          if [ "$ACTUAL" != "$DANMU_VERSION" ]; then
+            echo "::error:::9321 实际在服务的是 danmu_api $ACTUAL，期望 $DANMU_VERSION —— 端口没被最新版抢到，拒绝推送这种 dist"
+            exit 1
+          fi
+          echo "✓ 真机模拟自检通过：:9321 正在服务 danmu_api $ACTUAL"
+          echo "serving=$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "sidecarDir=$(grep -o 'writable dir selected: [^ ]*' "$SIM/boot.log" | head -n1 | cut -d' ' -f4- || true)" >> "$GITHUB_OUTPUT"
+
+      # ---------- 7. dist 已是最新则跳过推送 ----------
       - name: Check if dist is already up to date
         id: cmp
         env:
@@ -430,7 +636,7 @@ jobs:
             echo "将重建 dist（force=${FORCE:-}, changed=$([ "$SAME" = "true" ] && echo no || echo yes)）"
           fi
 
-      # ---------- 7. 部署：force-push dist 分支（布局与 deploy.yml 完全一致） ----------
+      # ---------- 8. 部署：force-push dist 分支（布局与 deploy.yml 完全一致） ----------
       - name: Deploy to dist branch
         if: steps.cmp.outputs.skip != 'true'
         env:
@@ -451,21 +657,27 @@ jobs:
           git push --force -q "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" dist
           echo "dist branch updated ✓"
 
-      # ---------- 8. 运行摘要 ----------
+      # ---------- 9. 运行摘要 ----------
       - name: Summary
         if: always()
         env:
           DANMU_VERSION: ${{ steps.danmu.outputs.version }}
           DANMU_SHA: ${{ steps.danmu.outputs.sha }}
           SKIP: ${{ steps.cmp.outputs.skip }}
+          SERVED: ${{ steps.verify.outputs.serving }}
+          SIDECAR_DIR: ${{ steps.verify.outputs.sidecarDir }}
         run: |
           {
             echo "## danmu-latest 构建摘要"
             echo ""
             echo "| 项目 | 值 |"
             echo "|------|-----|"
-            echo "| danmu_api 版本 | v${DANMU_VERSION:-?} (${DANMU_SHA:0:7}) |"
+            echo "| 内嵌 danmu_api 版本 | v${DANMU_VERSION:-?} (${DANMU_SHA:0:7}) |"
+            echo "| 真机模拟自检（:9321 /api/config） | v${SERVED:-未通过} |"
+            echo "| sidecar 落盘目录 | ${SIDECAR_DIR:-?} |"
             echo "| 结果 | $([ "${SKIP:-}" = "true" ] && echo '无变化，跳过推送' || echo '已重建并推送 dist 分支') |"
             echo ""
-            echo "dist 分支 \`nodejs/dist/index.js\` 内嵌最新弹幕 API；旧版内置弹幕自动让位（端口抢占），失败自动回退。"
+            echo "自检环境复刻真机：宿主 cwd 只读 + 无 /tmp，只留 NODE_PATH 可写。"
+            echo "dist 分支 \`nodejs/dist/index.js\` 内嵌最新弹幕 API；旧版内置弹幕自动让位（端口抢占），失败自动回退，"
+            echo "接管成功时同步引擎内联的版本标识，回退时再还原。App 端可开 http://<设备IP>:9322/ 查当前在服务版本。"
           } >> "$GITHUB_STEP_SUMMARY"
